@@ -1,0 +1,185 @@
+library(monocle)
+library("DDRTree")
+library("pheatmap")
+
+
+Aggregated_seurat=readsCountSM_TSNE
+
+exp_matrix<-as(as.matrix(Aggregated_seurat@assays$RNA@counts), 'sparseMatrix') 
+
+## 2. pd :细胞-细胞特征注释矩阵
+sample_info <- data.frame(cluster = Aggregated_seurat@active.ident, sample_names = Aggregated_seurat$orig.ident)
+rownames(sample_info)<-colnames(exp_matrix)
+pd<-new("AnnotatedDataFrame", data =sample_info)
+
+
+## 3. fd  :基因-基因特征注释矩阵
+feature_ann<-data.frame(gene_id=rownames(exp_matrix),gene_short_name=rownames(exp_matrix))
+rownames(feature_ann)<-rownames(exp_matrix)
+fd <- new("AnnotatedDataFrame", data = feature_ann)
+
+## 构建celldataset
+zebrafish_cds<-newCellDataSet(exp_matrix,
+                              phenoData = pd,
+                              featureData = fd,
+                              expressionFamily=negbinomial.size(),
+                              lowerDetectionLimit = 0.5)##To work with count data, specify the negative binomial distribution as the expressionFamily argument to newCellDataSet
+names(pData(zebrafish_cds))[names(pData(zebrafish_cds))=="seurat_clusters"]="Cluster"
+##----------------------step 2：Estimate size factors and dispersions Required 为了后期计算方便
+## Size factors help us WTize for differences in mRNA recovered across cells
+## "dispersion" values will help us perform differential expression analysis later.
+
+zebrafish_cds <- estimateSizeFactors(zebrafish_cds)
+
+zebrafish_cds <- estimateDispersions(zebrafish_cds) #305个outlier
+
+
+##-----------------------step 3: Filtering low-quality cells Recommended(在Seurat中做了跳过)
+
+zebrafish_cds <- detectGenes(zebrafish_cds, min_expr = 0.1)
+
+print(head(fData(zebrafish_cds)))
+expressed_genes <- row.names(subset(fData(zebrafish_cds),num_cells_expressed >= 10)) ## 过滤掉少于10个细胞中表达的基因
+
+zebrafish_cds <- zebrafish_cds[expressed_genes,]
+
+##-----------------------step 4: 标准化数据
+ #Log-transform each value in the expression matrix.
+#L <- log(exprs(zebrafish_cds))
+
+# Standardize each gene, so that they are all on the same scale,
+# Then melt the data with plyr so we can plot it easily
+#library(reshape)
+#melted_dens_df <- melt(Matrix::t(scale(Matrix::t(L))))
+
+##------------------------step 5：Clustering cells without marker genes
+disp_table <- dispersionTable(zebrafish_cds)
+unsup_clustering_genes <- subset(disp_table, mean_expression >= 0.1)
+zebrafish_cds <- setOrderingFilter(zebrafish_cds, unsup_clustering_genes$gene_id)
+
+#zebrafish_cds <- setOrderingFilter(zebrafish_cds, ordering_genes)
+#plot_ordering_genes(zebrafish_cds)
+
+# HSMM@auxClusteringData[["tSNE"]]$variance_explained <- NULL
+#plot_pc_variance_explained(zebrafish_cds, return_all = F) # norm_method='log'
+
+
+zebrafish_cds <- reduceDimension(zebrafish_cds, max_components = 2, num_dim = 6,
+                                 reduction_method = 'tSNE', verbose = T)
+zebrafish_cds <- clusterCells(zebrafish_cds, num_clusters = 4)
+#plot_cell_clusters(zebrafish_cds, 1, 2, color_by = "cluster")
+
+##-------------------------step 6: Constructing Single Cell Trajectories
+
+## 1.选择定义细胞发展的基因 不再是以差异基因，而是细胞周期基因来看
+#diff_test_res <- differentialGeneTest(zebrafish_cds,fullModelFormulaStr = "~cluster")
+#ordering_genes <- row.names (subset(diff_test_res, qval < 0.05))
+
+#ordering_genes <- Aggregated_seurat@assays[["RNA"]]@var.features
+ordering_genes=as.vector(read.table("DEG.txt")[,1]) #620 genes
+
+zebrafish_cds <- setOrderingFilter(zebrafish_cds, ordering_genes)
+
+#plot_ordering_genes(zebrafish_cds)
+
+## 2.数据降维
+zebrafish_cds <- reduceDimension(zebrafish_cds, max_components = 2,
+                                 method = 'DDRTree')
+
+
+## 3.将细胞按照伪时间排序
+
+zebrafish_cds <- orderCells(zebrafish_cds)
+## Once the cells are ordered, we can visualize the trajectory in the reduced dimensional space.
+
+## 查看能用于上色区分的变量
+colnames(pData(zebrafish_cds))
+
+
+
+## 保存图片
+
+
+##  Monocle 中的state
+p1 <- plot_cell_trajectory(zebrafish_cds, color_by = "State")
+
+
+pdf("Trajectory_state_DEG.pdf",6,6)
+p1
+
+dev.off()
+
+
+
+#p10 <- plot_cell_trajectory(zebrafish_cds, color_by = "sample_names",show_backbone = F,show_tree = F,show_branch_points = F)+ geom_smooth(colour="black",linetype="solid",se=FALSE)
+p10 <- plot_cell_trajectory(zebrafish_cds, color_by = "sample_names")
+
+
+pdf("Trajectory_sample_names_DEG.pdf",7,7)
+
+p10
+dev.off()
+
+##  将Monocle sample_names 划分画图
+p1 <- plot_cell_trajectory(zebrafish_cds, color_by = "sample_names") + facet_wrap(~cluster, nrow = 1)
+pdf("Trajectory_state_split_by_cluster.pdf",20,5)
+
+p1
+dev.off()
+
+##  Monocle 中的 sample_names
+p1 <- plot_cell_trajectory(zebrafish_cds, color_by = "sample_names")
+pdf("Trajectory_sample_cellcycle.pdf",6,6)
+p1
+dev.off()
+
+##  将Monocle 中的sample_names根据cluster 划分画图
+p1 <- plot_cell_trajectory(zebrafish_cds, color_by = "sample_names") + facet_wrap(~cluster, nrow = 1) +
+  labs(x = "tSNE1", y = "tSNE2")
+pdf("Trajectory_sample_names_split_by_cluster.pdf",20,5)
+p1
+dev.off()
+
+## Monocle 中的Cluster
+
+p2 <- plot_cell_trajectory(zebrafish_cds, color_by = "cluster") + facet_wrap(~cluster, nrow = 1)
+pdf("Trajectory_Cluster_by_seurat_split.pdf",20,5)
+p2
+dev.off()
+
+p3 <- plot_cell_trajectory(zebrafish_cds, color_by = "cluster")
+pdf("Trajectory_Cluster_by_seurat_combined.pdf",7,7)
+p3
+dev.off()
+
+## Trajectory_Pseudotime
+
+p4 <- plot_cell_trajectory(zebrafish_cds, color_by = "Pseudotime",show_tree = F,show_backbone = F,show_branch_points=TRUE) 
+pdf("Trajectory_Pseudotime.pdf",6,6)
+p4
+dev.off()
+
+## Trajectory_Pseudotime_split
+p5 <- plot_cell_trajectory(zebrafish_cds, color_by = "Pseudotime") + facet_wrap(~cluster, nrow = 1)
+pdf("Trajectory_Pseudotime_split_by_cluster.pdf",20,5)
+p5 
+dev.off()
+
+#to_be_tested=row.names(subset(fData(zebrafish_cds),gene_short_name %in% c("SAGE1","UTF1","KIT","MKI67","DMRT1","FGFR3","GFRA1","SYCP3","SOHLH2")))
+to_be_tested=row.names(subset(fData(zebrafish_cds),gene_short_name %in% c("TXNIP"))) 
+cds_subset=zebrafish_cds[to_be_tested,]
+
+pdf("TXNIP.pdf",5,3)
+p=plot_genes_in_pseudotime(cds_subset, color_by = "sample_names")
+p
+dev.off()
+
+rank=as.vector(read.table("C:/Users/WZ/Desktop/Tang2018sperm/0_Final/haha.txt")[,1])
+data= na.omit(exp_count[,rank])
+gene=as.vector(read.table("C:/Users/WZ/Desktop/Tang2018sperm/gene.txt")[,1])
+#gene=c("UTF1","FGFR3","GFRA1","SAGE1","TXNIP","KIT","MKI67","DMRT1","SYCP3")
+data_gene= na.omit(data[gene,])
+data_gene=log(data_gene+1)
+write.csv(data_map_1,"Pseudotime_rank_paperclustergene.csv")
+
+saveRDS(zebrafish_cds, file = "monocle_SSC1_diffed.rds")
